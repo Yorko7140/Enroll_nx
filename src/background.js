@@ -12,7 +12,10 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
     });
     sendResponse({ status: 'success' });
   }
-  else{
+  else if (request.action === 'xzzdGetSigned') {
+    return false; // 交给下面 xzzd 嗅探监听器处理
+  }
+  else if (request && request.data){
     let data = request.data;
     showDataOnPage(data.title, data.message, data.closeTime, data.url);
     sendResponse("已执行弹窗");
@@ -82,6 +85,49 @@ chrome.webRequest.onCompleted.addListener(
   },
   { urls: ["https://courses.zju.edu.cn/api/uploads/reference/document/*/url"] },
 );
+// ===== 学在浙大（xzzd）预览链接嗅探 =====
+// WPS/pdf.js 预览常常在跨域 iframe 里渲染，内容脚本读不到 src；
+// 但浏览器实际请求过 tcmedia 的签名下载链——在后台按标签页记下来，内容脚本随时来取。
+const XZZD_SIGNED = new Map(); // tabId -> [url...]
+
+function rememberXzzdSigned(tabId, url) {
+  if (!url || tabId === undefined || tabId < 0) return;
+  const list = (XZZD_SIGNED.get(tabId) || []).filter((item) => item !== url);
+  list.unshift(url);
+  const kept = list.slice(0, 12);
+  XZZD_SIGNED.set(tabId, kept);
+  try {
+    chrome.storage.local.set({ ["xzzd:signed:" + tabId]: kept });
+  } catch (e) { /* ignore */ }
+}
+
+chrome.webRequest.onBeforeRequest.addListener(
+  function (details) {
+    if (/tcmedia\.zju\.edu\.cn\/.*\/download\//i.test(details.url)
+      || /\/api\/uploads\/(reference\/)?(document|image|audio)\/[^/]+\/url/i.test(details.url)) {
+      rememberXzzdSigned(details.tabId, details.url);
+    }
+  },
+  { urls: ["https://tcmedia.zju.edu.cn/*", "http://tcmedia.zju.edu.cn/*", "https://courses.zju.edu.cn/api/uploads/*"] }
+);
+
+chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
+  if (request && request.action === "xzzdGetSigned") {
+    const tabId = sender && sender.tab ? sender.tab.id : -1;
+    const stored = tabId >= 0 ? XZZD_SIGNED.get(tabId) || [] : [];
+    chrome.storage.local.get(["xzzd:signed:" + tabId], function (result) {
+      const disk = result["xzzd:signed:" + tabId] || [];
+      const merged = [];
+      [...stored, ...disk].forEach(function (url) {
+        if (url && merged.indexOf(url) === -1) merged.push(url);
+      });
+      sendResponse({ urls: merged, tabId: tabId });
+    });
+    return true;
+  }
+  return false;
+});
+
 // 监听插件安装时初始化设置
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.sync.set({ showDiv: true }, () => {

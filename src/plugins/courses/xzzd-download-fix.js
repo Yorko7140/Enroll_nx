@@ -29,7 +29,40 @@ const state = {
   attempts: [],                                  // [{label, status, note}]
   uploadCache: new Map(),                        // courseId -> uploads
   signedCache: new Map(),                        // key -> signed url
+  shapes: [],                                    // 接口返回体结构快照（诊断用）
 };
+
+/** 只留结构信息：顶层键、活动数、第一条活动的键与 uploads 概况 */
+function shapeOf(label, data) {
+  const info = { label, topKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 20) : typeof data };
+  const acts = Array.isArray(data && data.activities) ? data.activities
+    : (Array.isArray(data) ? data : null);
+  if (acts) {
+    info.activityCount = acts.length;
+    const first = acts.find((a) => Array.isArray(a.uploads) && a.uploads.length) || acts[0];
+    if (first) {
+      info.firstActivity = {
+        keys: Object.keys(first).slice(0, 30),
+        id: first.id,
+        type: first.type,
+        name: first.name,
+        title: first.title,
+        uploads: Array.isArray(first.uploads) ? first.uploads.length : 'none',
+        firstUpload: Array.isArray(first.uploads) ? first.uploads[0] : null,
+      };
+    }
+  } else if (data && typeof data === 'object') {
+    info.keys = Object.keys(data).slice(0, 30);
+    info.id = data.id;
+    info.type = data.type;
+    info.name = data.name;
+    info.uploads = Array.isArray(data.uploads) ? data.uploads.length : 'none';
+    info.firstUpload = Array.isArray(data.uploads) ? data.uploads[0] : null;
+  }
+  state.shapes.push(info);
+  if (state.shapes.length > 6) state.shapes.shift();
+  return info;
+}
 
 function note(label, status, extra = '') {
   state.attempts.push({ label, status, extra });
@@ -219,6 +252,37 @@ function currentReferType() {
 }
 
 /** 同源 iframe / #pdf-viewer 里 pdf.js 的影印件：最可信的「当前文件」来源 */
+/** 后台嗅探到的 tcmedia 签名链（WPS/pdf.js 预览在跨域 iframe 里时，这是唯一线索） */
+async function sniffedSignedUrls() {
+  const out = [];
+  const push = (raw) => {
+    if (!raw || typeof raw !== 'string') return;
+    if (!/tcmedia\.zju\.edu\.cn\/.*\/download\//i.test(raw)) return;
+    if (!out.includes(raw)) out.push(raw);
+  };
+
+  try {
+    const res = await new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ action: 'xzzdGetSigned' }, (reply) => resolve(reply));
+      } catch (e) { resolve(null); }
+      setTimeout(() => resolve(null), 800);
+    });
+    ((res && res.urls) || []).forEach(push);
+  } catch (e) { /* ignore */ }
+
+  try {
+    const stored = await new Promise((resolve) => {
+      try {
+        chrome.storage.sync.get(['pptUrl'], (r) => resolve(r));
+      } catch (e) { resolve(null); }
+    });
+    if (stored && stored.pptUrl) push(stored.pptUrl);
+  } catch (e) { /* ignore */ }
+
+  return out;
+}
+
 function viewerSignedUrls() {
   const urls = [];
   const push = (raw) => {
@@ -260,33 +324,56 @@ function viewerSignedUrls() {
 /* ------------------------------------------------------------- 课件列表 API */
 
 const UPLOAD_TYPES_DOWNLOADABLE = new Set(['document', 'image', 'audio', 'video']);
+// 活动类型：这些对象自带 id/name/type，但它们是「活动」不是「附件」——
+// 旧逻辑把 type=material、name=操作手册 的活动当成附件，导致 uploads 没被展开。
+const ACTIVITY_TYPES = new Set([
+  'material', 'homework', 'exam', 'discussion', 'classroom', 'questionnaire',
+  'web_link', 'announcement', 'feedback', 'offline_activity', 'online_video',
+  'lesson', 'scorm', 'survey', 'attendance', 'live', 'interaction',
+]);
 
+function isContainer(obj) {
+  return Array.isArray(obj.uploads) || ACTIVITY_TYPES.has(String(obj.type || ''));
+}
+
+function looksLikeUpload(obj) {
+  if (!obj || (typeof obj.id !== 'number' && typeof obj.reference_id !== 'number')) return false;
+  if (isContainer(obj)) return false;
+  if (obj.mime_type || obj.mime || obj.content_type) return true;
+  const type = String(obj.type || '');
+  if (UPLOAD_TYPES_DOWNLOADABLE.has(type)) return true;
+  return type === '' && (obj.status === 'ready' || typeof obj.size === 'number');
+}
+
+/** 只收真正的附件；遇到带 uploads 的活动先下钻，别把它自己当附件 */
 function harvestUploads(payload, bucket, seen, activityId) {
-  if (!payload || typeof payload !== 'object') return;
   if (Array.isArray(payload)) {
     payload.forEach((item) => harvestUploads(item, bucket, seen, activityId));
     return;
   }
-  const looksLikeUpload = (payload.id || payload.reference_id)
-    && (payload.name || payload.filename || payload.title)
-    && (payload.type || payload.status || payload.size || payload.mime_type);
-  if (looksLikeUpload) {
+  if (!payload || typeof payload !== 'object') return;
+
+  if (looksLikeUpload(payload)) {
     const key = String(payload.reference_id || payload.id);
     if (!seen.has(key)) {
       seen.add(key);
       bucket.push({
         id: payload.id,
         reference_id: payload.reference_id,
-        name: payload.name || payload.filename || payload.title,
+        name: payload.name || payload.filename || payload.title || `upload-${payload.id}`,
         type: payload.type || '',
         status: payload.status || '',
         size: payload.size || 0,
-        activityId: activityId || payload.activity_id || payload.activityId || null,
+        mime: payload.mime_type || payload.mime || payload.content_type || '',
+        activityId: activityId || null,
       });
     }
     return;
   }
-  const nextActivity = payload.id && Array.isArray(payload.uploads) ? payload.id : activityId;
+
+  const nextActivity = (typeof payload.id === 'number' && Array.isArray(payload.uploads))
+    ? payload.id
+    : activityId;
   Object.keys(payload).forEach((key) => {
     const value = payload[key];
     if (value && typeof value === 'object') harvestUploads(value, bucket, seen, nextActivity);
@@ -297,10 +384,12 @@ async function listActivityUploads(activityId) {
   const endpoints = [
     `${API}/activities/${activityId}?sub_course_id=0`,
     `${API}/activities/${activityId}`,
+    `${API}/activities/${activityId}/uploads`,
   ];
   for (const endpoint of endpoints) {
     try {
       const data = await jget(endpoint, 'activity');
+      shapeOf(`activity:${activityId}`, data);
       const uploads = [];
       harvestUploads(data && (data.activity || data), uploads, new Set(), activityId);
       if (uploads.length) return uploads;
@@ -322,6 +411,7 @@ async function listCourseUploads(courseId, { force = false } = {}) {
   for (const endpoint of endpoints) {
     try {
       const data = await jget(endpoint, 'list');
+      shapeOf(endpoint.replace(API, ''), data);
       const uploads = [];
       harvestUploads(data, uploads, new Set(), null);
       if (uploads.length) {
@@ -378,6 +468,16 @@ async function resolveCurrent({ quiet = false } = {}) {
       return { ...info, via: 'viewer-url' };
     } catch (e) {
       LOG('viewer 链不可用', url, e.message);
+    }
+  }
+
+  // 1.5) 后台嗅探到的签名链（跨域 iframe / WPS 预览读不到 src 时的兜底）
+  for (const url of await sniffedSignedUrls()) {
+    try {
+      const info = await saveSigned(url, nameFromSigned(url, 'courseware.pdf'));
+      return { ...info, via: 'sniffed' };
+    } catch (e) {
+      LOG('嗅探链不可用', url.slice(0, 80), e.message);
     }
   }
 
@@ -479,6 +579,7 @@ function mountPanel() {
       <button data-act="cur" style="width:100%;margin:3px 0;padding:6px;border:0;border-radius:6px;background:#003f88;color:#fff;cursor:pointer">下载当前课件</button>
       <button data-act="list" style="width:100%;margin:3px 0;padding:6px;border:0;border-radius:6px;background:#1d6fb8;color:#fff;cursor:pointer">选择课件下载</button>
       <button data-act="all" style="width:100%;margin:3px 0;padding:6px;border:0;border-radius:6px;background:#3c8f45;color:#fff;cursor:pointer">下载本课程全部</button>
+      <button data-act="sniff" style="width:100%;margin:3px 0;padding:6px;border:0;border-radius:6px;background:#8a5a00;color:#fff;cursor:pointer">下载预览中的文件</button>
       <button data-act="diag" style="width:100%;margin:3px 0;padding:4px;border:1px solid #ccd;border-radius:6px;background:#f7f9fc;color:#456;cursor:pointer;font-size:12px">诊断（复制到剪贴板）</button>
       <div id="zju-webx-xzzd-list" style="display:none;margin-top:6px;max-height:260px;overflow:auto;border-top:1px solid #e3e8f0"></div>
       <div id="zju-webx-xzzd-msg" style="margin-top:6px;color:#555;max-width:300px;word-break:break-all;font-size:12px"></div>
@@ -521,6 +622,35 @@ function mountPanel() {
       return;
     }
 
+    if (act === 'sniff') {
+      setMsg('查找预览链接…');
+      button.disabled = true;
+      try {
+        const urls = await sniffedSignedUrls();
+        if (!urls.length) {
+          setMsg('没抓到预览链接：先把课件在页面里翻一页，再点这个按钮');
+          return;
+        }
+        LOG('嗅探到', urls.length, urls[0].slice(0, 90));
+        let last = null;
+        for (const url of urls) {
+          try {
+            last = await saveSigned(url, nameFromSigned(url, 'courseware.pdf'));
+            break;
+          } catch (e) {
+            LOG('嗅探链不可用', url.slice(0, 60), e.message);
+          }
+        }
+        setMsg(last ? `已下载 ${last.name}${last.size > 0 ? `（${last.size} 字节）` : ''}` : `抓到 ${urls.length} 条链接但都取不到字节`);
+      } catch (e) {
+        setMsg(`失败：${e.message || e}`);
+      } finally {
+        button.disabled = false;
+        renderAttempts(box);
+      }
+      return;
+    }
+
     if (act === 'diag') {
       const courseId = currentCourseId();
       const activityId = currentActivityId();
@@ -533,9 +663,11 @@ function mountPanel() {
         activityId,
         referType: currentReferType(),
         viewer: viewerSignedUrls(),
+        sniffed: await sniffedSignedUrls(),
         uploadCount: uploads.length,
         uploads: uploads.slice(0, 20),
         activityUploads,
+        shapes: state.shapes,
         attempts: state.attempts,
       };
       try {
