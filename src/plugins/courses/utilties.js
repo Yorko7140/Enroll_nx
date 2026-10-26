@@ -78,9 +78,15 @@ function trackDownloadingOnXHR(url, filename, progress_callback, complete_callba
     xhr.onerror = (e) => complete_callback(false, xhr.status, xhr.statusText);
     // xhr.onabort = (e) => complete_callback(false, xhr.status, xhr.statusText);
 	xhr.onload = () => {
-		if (xhr.status != 200) {
-			console.error(`下载失败 ${xhr.status}: ${xhr.statusText}`);
-		} else {//success
+		const contentType = (xhr.getResponseHeader("content-type") || "").toLowerCase();
+		//平台权限错误是 HTTP 200 + {"message":"您没有权限完成此操作"}，
+		//只判断 status 会把这段 JSON 当成课件写进 .pdf（就是“打不开的 PDF”）。这里必须拦掉。
+		if (xhr.status != 200 || contentType.includes("json")) {
+			console.error(`下载失败 ${xhr.status}: ${xhr.statusText} ${contentType}`);
+			complete_callback(false, xhr.status, `${xhr.statusText}${contentType ? " " + contentType : ""}`);
+			return;
+		}
+		{//success
 			let res = xhr.response;
 			let blob = new Blob([res], {
 				type: "application/octet-stream",

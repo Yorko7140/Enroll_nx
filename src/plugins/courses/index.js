@@ -1,6 +1,7 @@
 import { zdbk_xsbtx } from "./zdbk.js"
 import * as courses from "./todos.js"
 import downloadpdf from "./pdfDownloading.js";
+import mountXzzdDownloadFix from "./xzzd-download-fix.js";
 import "./la-locean-courseware-download.js";
 const webxConfig = {
     runAsBookmark: false,
@@ -29,6 +30,7 @@ export default () => {
             courses.fetchTodoData();
             courses.observeTodoList();
             downloadpdf();
+            mountXzzdDownloadFix();//课件下载修复：走预览签名链，避免把 {"message":...} 存成 PDF
         }
         else {
             urlHandled = false;
