@@ -124,16 +124,20 @@ function signEndpoints(upload, ctx = {}) {
   const id = upload && upload.id;
   const referType = ctx.referType || 'learning_activity';
   const refer = ctx.activityId ? `&refer_id=${ctx.activityId}&refer_type=${referType}` : '';
+  // 实测顺序（courses.zju.edu.cn）：
+  //   document/{id}/url?preview=true        多数只读件 200
+  //   document/{id}/url?preview=true&refer… 部分件只有带 refer 才 200
+  //   reference/document/{ref}/url          该课程一律 403 {"message":""}，放最后当兜底
   const raw = [];
-  if (rid) {
-    raw.push([`reference/document/${rid}/url?preview=true`, 'ref']);
-    raw.push([`reference/document/${rid}/url?preview=true${refer}`, 'ref+refer']);
-  }
   if (id) {
     raw.push([`document/${id}/url?preview=true`, 'doc']);
     raw.push([`document/${id}/url?preview=true${refer}`, 'doc+refer']);
     raw.push([`${id}?preview=true`, 'raw']);
     raw.push([`${id}?preview=true${refer}`, 'raw+refer']);
+  }
+  if (rid) {
+    raw.push([`reference/document/${rid}/url?preview=true`, 'ref']);
+    raw.push([`reference/document/${rid}/url?preview=true${refer}`, 'ref+refer']);
   }
   const seen = new Set();
   return raw
@@ -257,7 +261,7 @@ async function sniffedSignedUrls() {
   const out = [];
   const push = (raw) => {
     if (!raw || typeof raw !== 'string') return;
-    if (!/tcmedia\.zju\.edu\.cn\/.*\/download\//i.test(raw)) return;
+    if (!/tcmedia\.zju\.edu\.cn\/download\/(file|processed|media)\//i.test(raw)) return;
     if (!out.includes(raw)) out.push(raw);
   };
 
@@ -301,7 +305,7 @@ function viewerSignedUrls() {
           const file = new URL(parsed).searchParams.get('file');
           if (file) push(decodeURIComponent(file));
         } catch (e) { /* ignore */ }
-        if (/tcmedia\.zju\.edu\.cn\/.*\/download\//i.test(parsed)) push(parsed);
+        if (/tcmedia\.zju\.edu\.cn\/download\/(file|processed|media)\//i.test(parsed)) push(parsed);
       });
     } catch (e) { /* ignore */ }
   };

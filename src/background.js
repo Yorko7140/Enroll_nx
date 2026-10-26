@@ -103,7 +103,7 @@ function rememberXzzdSigned(tabId, url) {
 
 chrome.webRequest.onBeforeRequest.addListener(
   function (details) {
-    if (/tcmedia\.zju\.edu\.cn\/.*\/download\//i.test(details.url)
+    if (/tcmedia\.zju\.edu\.cn\/download\//i.test(details.url)
       || /\/api\/uploads\/(reference\/)?(document|image|audio)\/[^/]+\/url/i.test(details.url)) {
       rememberXzzdSigned(details.tabId, details.url);
     }
