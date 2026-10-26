@@ -21,7 +21,6 @@
  */
 
 const API = 'https://courses.zju.edu.cn/api';
-const PANEL_ID = 'zju-webx-xzzd-panel';
 const LOG = (...args) => console.log('[zju-webx][xzzd]', ...args);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -30,6 +29,7 @@ const state = {
   uploadCache: new Map(),                        // courseId -> uploads
   signedCache: new Map(),                        // key -> signed url
   shapes: [],                                    // 接口返回体结构快照（诊断用）
+  rescued: new Set(),                            // 已通过 blob 兜底处理过的 upload id
 };
 
 /** 只留结构信息：顶层键、活动数、第一条活动的键与 uploads 概况 */
@@ -543,7 +543,7 @@ async function downloadWholeCourse(onProgress, { includeMedia = false } = {}) {
   return { ok, failed, total: uploads.length };
 }
 
-/* -------------------------------------------------------------------- 面板 */
+/* ------------------------------------------------------- 接管平台「下载课件」 */
 
 function ensureTopFrame() {
   try {
@@ -553,223 +553,220 @@ function ensureTopFrame() {
   }
 }
 
-function renderAttempts(box) {
-  const logBox = box.querySelector('#zju-webx-xzzd-log');
-  if (!logBox) return;
-  const recent = state.attempts.slice(-8).map((a) => `${a.status} ${a.label} ${a.extra || ''}`.trim());
-  logBox.textContent = recent.join('\n');
+function normalizeText(node) {
+  return (node.textContent || '').replace(/\s+/g, '');
 }
 
-function mountPanel() {
-  if (!/^courses\.zju\.edu\.cn$/i.test(location.hostname)) return;
-  if (!ensureTopFrame()) return;
-  if (document.getElementById(PANEL_ID)) return;
+/** 从点击目标向上找平台那颗「下载课件」按钮（按文字认，不依赖 class） */
+function findPlatformEntry(target) {
+  const ENTRY = '下载课件';
+  let node = target;
+  for (let depth = 0; node && node.nodeType === 1 && depth < 6; depth += 1, node = node.parentElement) {
+    if (node.dataset && node.dataset.zjuXzzdStatus) return null;   // 别把自己的状态条当按钮
+    const text = normalizeText(node);
+    if (text === ENTRY) return node;
+    if (text.length > ENTRY.length + 4) break;
+  }
+  return null;
+}
 
-  const box = document.createElement('div');
-  box.id = PANEL_ID;
-  box.style.cssText = [
-    'position:fixed', 'right:18px', 'bottom:18px', 'z-index:2147483647',
-    'background:#fff', 'border:1px solid #003f88', 'border-radius:10px',
-    'box-shadow:0 6px 24px rgba(0,0,0,.18)', 'padding:10px 12px',
-    'font:13px/1.5 -apple-system,"Microsoft YaHei",sans-serif', 'color:#0b2545',
-    'min-width:220px', 'max-width:340px', 'user-select:none',
-  ].join(';');
-  box.innerHTML = `
-    <div style="font-weight:700;margin-bottom:6px;color:#003f88;display:flex;justify-content:space-between;align-items:center">
-      <span>学在浙大课件下载</span>
-      <span id="zju-webx-xzzd-min" style="cursor:pointer;color:#888;font-weight:400">—</span>
-    </div>
-    <div id="zju-webx-xzzd-body">
-      <button data-act="cur" style="width:100%;margin:3px 0;padding:6px;border:0;border-radius:6px;background:#003f88;color:#fff;cursor:pointer">下载当前课件</button>
-      <button data-act="list" style="width:100%;margin:3px 0;padding:6px;border:0;border-radius:6px;background:#1d6fb8;color:#fff;cursor:pointer">选择课件下载</button>
-      <button data-act="all" style="width:100%;margin:3px 0;padding:6px;border:0;border-radius:6px;background:#3c8f45;color:#fff;cursor:pointer">下载本课程全部</button>
-      <button data-act="sniff" style="width:100%;margin:3px 0;padding:6px;border:0;border-radius:6px;background:#8a5a00;color:#fff;cursor:pointer">下载预览中的文件</button>
-      <button data-act="diag" style="width:100%;margin:3px 0;padding:4px;border:1px solid #ccd;border-radius:6px;background:#f7f9fc;color:#456;cursor:pointer;font-size:12px">诊断（复制到剪贴板）</button>
-      <div id="zju-webx-xzzd-list" style="display:none;margin-top:6px;max-height:260px;overflow:auto;border-top:1px solid #e3e8f0"></div>
-      <div id="zju-webx-xzzd-msg" style="margin-top:6px;color:#555;max-width:300px;word-break:break-all;font-size:12px"></div>
-      <pre id="zju-webx-xzzd-log" style="display:none;margin:6px 0 0;padding:4px;background:#f7f9fc;border-radius:4px;font-size:10px;line-height:1.35;max-height:110px;overflow:auto;white-space:pre-wrap;color:#666"></pre>
-    </div>
-  `;
-  document.body.appendChild(box);
+let statusNode = null;
+let statusTimer = 0;
 
-  const msg = box.querySelector('#zju-webx-xzzd-msg');
-  const listBox = box.querySelector('#zju-webx-xzzd-list');
-  const logBox = box.querySelector('#zju-webx-xzzd-log');
-  const setMsg = (text) => { msg.textContent = text; renderAttempts(box); };
+/** 状态直接挂在平台按钮旁边（行内文字，不是悬浮窗） */
+function showStatus(text, entry) {
+  if (!entry || !entry.parentElement) return;
+  if (!statusNode || !statusNode.isConnected) {
+    statusNode = document.createElement('span');
+    statusNode.dataset.zjuXzzdStatus = '1';
+    statusNode.style.cssText = [
+      'margin-left:10px', 'font:12px/1.4 -apple-system,"Microsoft YaHei",sans-serif',
+      'color:#1d6fb8', 'pointer-events:none', 'white-space:nowrap',
+    ].join(';');
+    entry.insertAdjacentElement('afterend', statusNode);
+  }
+  statusNode.textContent = text;
+  statusNode.style.color = /失败|无/.test(text) ? '#c1272d' : '#1d6fb8';
+  if (statusTimer) clearTimeout(statusTimer);
+  if (!/下载中|准备/.test(text)) {
+    statusTimer = setTimeout(() => {
+      if (statusNode && statusNode.isConnected && !/下载中/.test(statusNode.textContent || '')) {
+        statusNode.textContent = '';
+      }
+    }, 8000);
+  }
+}
 
-  logBox.style.display = 'block';
+/** 本页面应该下载的课件：优先当前活动的 uploads，其次课程列表里出现在页面上的那些 */
+async function pageCoursewares() {
+  const aid = currentActivityId();
+  let uploads = aid ? await listActivityUploads(aid).catch(() => []) : [];
+  if (uploads.length) return { uploads, source: `activity:${aid}` };
 
-  box.querySelector('#zju-webx-xzzd-min').addEventListener('click', () => {
-    const body = box.querySelector('#zju-webx-xzzd-body');
-    const hidden = body.style.display === 'none';
-    body.style.display = hidden ? 'block' : 'none';
-    box.querySelector('#zju-webx-xzzd-min').textContent = hidden ? '—' : '+';
+  const cid = currentCourseId();
+  if (!cid) return { uploads: [], source: 'none' };
+  const all = await listCourseUploads(cid).catch(() => []);
+  if (!all.length) return { uploads: [], source: 'none' };
+
+  const pageText = normalizeText(document.body);
+  const onPage = all.filter((u) => {
+    const stem = baseName(u.name).replace(/\.[^.]+$/, '').slice(0, 6);
+    return stem && pageText.includes(stem);
   });
+  return { uploads: onPage.length ? onPage : all, source: onPage.length ? 'page-filtered' : 'course-list' };
+}
 
-  box.addEventListener('click', async (event) => {
-    const button = event.target.closest('button[data-act]');
-    if (!button) return;
-    const act = button.dataset.act;
+let running = false;
 
-    if (act === 'cur') {
-      setMsg('处理中…');
-      button.disabled = true;
-      try {
-        const info = await downloadCurrentCourseware();
-        setMsg(`已下载 ${info.name}${info.size > 0 ? `（${info.size} 字节）` : ''} · ${info.via}`);
-      } catch (e) {
-        setMsg(`失败：${e.message || e}`);
-      } finally {
-        button.disabled = false;
-        renderAttempts(box);
-      }
+async function runEntryDownload(entry) {
+  if (running) {
+    showStatus('正在下载，稍等…', entry);
+    return;
+  }
+  running = true;
+  const setStatus = (text) => showStatus(text, entry);
+  showStatus('准备…', entry);
+
+  try {
+    const { uploads, source } = await pageCoursewares();
+    if (!uploads.length) {
+      setStatus('这一步没找到课件，先点开课件再看');
       return;
     }
+    const docs = uploads.filter((u) => u.type === 'document' || !u.type);
+    const targets = docs.length ? docs : uploads;
+    LOG('入口下载', source, `${targets.length} 件`);
 
-    if (act === 'sniff') {
-      setMsg('查找预览链接…');
-      button.disabled = true;
+    const ctx = { referType: currentReferType() };
+    const ok = [];
+    const failed = [];
+    for (let i = 0; i < targets.length; i += 1) {
+      const upload = targets[i];
+      const label = upload.name || `upload-${upload.id}`;
+      setStatus(`下载中 ${i + 1}/${targets.length}：${label}`);
       try {
-        const urls = await sniffedSignedUrls();
-        if (!urls.length) {
-          setMsg('没抓到预览链接：先把课件在页面里翻一页，再点这个按钮');
-          return;
+        ok.push(await downloadUpload(upload, {
+          ...ctx,
+          activityId: upload.activityId || currentActivityId(),
+        }));
+      } catch (e) {
+        failed.push({ name: label, error: String(e.message || e) });
+        LOG('失败', label, e);
+      }
+      await sleep(350);
+    }
+
+    if (!failed.length) setStatus(`已下载 ${ok.length} 个文件`);
+    else if (ok.length) setStatus(`完成 ${ok.length} 个，失败 ${failed.length} 个（见控制台）`);
+    else setStatus(`下载失败：${failed[0].error}`);
+    if (failed.length) console.table(failed);
+  } catch (e) {
+    LOG('入口下载异常', e);
+    setStatus(`失败：${e.message || e}`);
+  } finally {
+    running = false;
+  }
+}
+
+function onPlatformClick(event) {
+  const entry = findPlatformEntry(event.target);
+  if (!entry) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+  runEntryDownload(entry);
+}
+
+/** 兜底：平台自己发 /blob 请求时（换了入口、或我们没拦住），顺手用签名链重下一份 */
+function patchBlobXhr() {
+  const proto = XMLHttpRequest.prototype;
+  if (proto.__zjuXzzdPatched) return;
+  proto.__zjuXzzdPatched = true;
+
+  const rawOpen = proto.open;
+  proto.open = function patchedOpen(method, url, ...rest) {
+    try {
+      this.__zjuXzzdUrl = typeof url === 'string' ? url : String(url);
+    } catch (e) { /* ignore */ }
+    return rawOpen.call(this, method, url, ...rest);
+  };
+
+  const rawSend = proto.send;
+  proto.send = function patchedSend(...args) {
+    try {
+      const url = this.__zjuXzzdUrl || '';
+      const hit = url.match(/\/api\/uploads\/(?:reference\/)?(?:document|image|audio|video)\/(\d+)\/blob/i)
+        || url.match(/\/api\/uploads\/(\d+)\/blob/i);
+      if (hit) {
+        const uploadId = Number(hit[1]);
+        if (!state.rescued.has(uploadId)) {
+          state.rescued.add(uploadId);
+          setTimeout(() => rescueBlob(uploadId), 0);
         }
-        LOG('嗅探到', urls.length, urls[0].slice(0, 90));
-        let last = null;
-        for (const url of urls) {
-          try {
-            last = await saveSigned(url, nameFromSigned(url, 'courseware.pdf'));
-            break;
-          } catch (e) {
-            LOG('嗅探链不可用', url.slice(0, 60), e.message);
-          }
-        }
-        setMsg(last ? `已下载 ${last.name}${last.size > 0 ? `（${last.size} 字节）` : ''}` : `抓到 ${urls.length} 条链接但都取不到字节`);
-      } catch (e) {
-        setMsg(`失败：${e.message || e}`);
-      } finally {
-        button.disabled = false;
-        renderAttempts(box);
       }
-      return;
-    }
+    } catch (e) { /* ignore */ }
+    return rawSend.apply(this, args);
+  };
+}
 
-    if (act === 'diag') {
-      const courseId = currentCourseId();
-      const activityId = currentActivityId();
-      const uploads = courseId ? await listCourseUploads(courseId, { force: true }).catch(() => []) : [];
-      const activityUploads = activityId ? await listActivityUploads(activityId).catch(() => []) : [];
-      const dump = {
-        href: location.href,
-        hash: location.hash,
-        courseId,
-        activityId,
-        referType: currentReferType(),
-        viewer: viewerSignedUrls(),
-        sniffed: await sniffedSignedUrls(),
-        uploadCount: uploads.length,
-        uploads: uploads.slice(0, 20),
-        activityUploads,
-        shapes: state.shapes,
-        attempts: state.attempts,
-      };
-      try {
-        await navigator.clipboard.writeText(JSON.stringify(dump, null, 2));
-        setMsg(`已复制诊断 JSON 到剪贴板（课件 ${uploads.length}、活动件 ${activityUploads.length}）`);
-      } catch (e) {
-        console.log('[zju-webx][xzzd] 诊断', dump);
-        setMsg('剪贴板不可用，诊断已打到控制台（F12）');
-      }
-      return;
-    }
-
-    if (act === 'list') {
-      if (listBox.style.display === 'block') {
-        listBox.style.display = 'none';
-        return;
-      }
-      setMsg('拉取课件列表…');
-      try {
-        const uploads = await listCourseUploads(currentCourseId(), { force: true });
-        listBox.innerHTML = '';
-        if (!uploads.length) {
-          setMsg('没解析到课件，点「诊断」把日志发我');
-          return;
-        }
-        uploads.forEach((upload) => {
-          const row = document.createElement('div');
-          row.style.cssText = 'display:flex;gap:6px;align-items:center;padding:3px 0;border-bottom:1px dashed #eef1f6';
-          const label = document.createElement('span');
-          label.textContent = `${upload.name}${upload.type && upload.type !== 'document' ? ` [${upload.type}]` : ''}`;
-          label.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px';
-          label.title = upload.name;
-          const pick = document.createElement('button');
-          pick.textContent = '下载';
-          pick.style.cssText = 'border:0;border-radius:4px;background:#1d6fb8;color:#fff;padding:2px 8px;cursor:pointer;font-size:12px';
-          pick.addEventListener('click', async () => {
-            pick.disabled = true;
-            setMsg(`下载 ${upload.name}…`);
-            try {
-              const info = await downloadUpload(upload, {
-                referType: currentReferType(),
-                activityId: upload.activityId || currentActivityId(),
-              });
-              setMsg(`已下载 ${info.name}${info.size > 0 ? `（${info.size} 字节）` : ''}`);
-            } catch (e) {
-              setMsg(`失败：${e.message || e}`);
-            } finally {
-              pick.disabled = false;
-              renderAttempts(box);
-            }
-          });
-          row.appendChild(label);
-          row.appendChild(pick);
-          listBox.appendChild(row);
-        });
-        listBox.style.display = 'block';
-        setMsg(`共 ${uploads.length} 项，点右侧「下载」`);
-      } catch (e) {
-        setMsg(`失败：${e.message || e}`);
-      } finally {
-        renderAttempts(box);
-      }
-      return;
-    }
-
-    if (act === 'all') {
-      button.disabled = true;
-      try {
-        const result = await downloadWholeCourse((i, total, name) => setMsg(`${i}/${total} ${name}`));
-        setMsg(`完成：成功 ${result.ok.length}，失败 ${result.failed.length}（共 ${result.total}）`);
-        if (result.failed.length) console.table(result.failed);
-      } catch (e) {
-        setMsg(`失败：${e.message || e}`);
-      } finally {
-        button.disabled = false;
-        renderAttempts(box);
-      }
-    }
-  });
+async function rescueBlob(uploadId) {
+  const aid = currentActivityId();
+  let pool = aid ? await listActivityUploads(aid).catch(() => []) : [];
+  let upload = pool.find((u) => u.id === uploadId || u.reference_id === uploadId);
+  if (!upload) {
+    const cid = currentCourseId();
+    pool = cid ? await listCourseUploads(cid).catch(() => []) : [];
+    upload = pool.find((u) => u.id === uploadId || u.reference_id === uploadId);
+  }
+  if (!upload) upload = { id: uploadId, reference_id: null, name: `upload-${uploadId}`, type: 'document' };
+  LOG('blob 兜底', upload.name);
+  try {
+    await downloadUpload(upload, { activityId: upload.activityId || aid, referType: currentReferType() });
+  } catch (e) {
+    LOG('blob 兜底失败', upload.name, e);
+  }
 }
 
 export default function mountXzzdDownloadFix() {
-  if (window.__zjuWebxXzzdMounted) return;
-  window.__zjuWebxXzzdMounted = true;
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', mountPanel);
-  } else {
-    mountPanel();
-  }
-  window.__xzzd = {
-    downloadCurrentCourseware,
-    downloadWholeCourse,
-    listCourseUploads,
-    listActivityUploads,
-    signUrl,
-    saveSigned,
-    viewerSignedUrls,
-    resolveCurrent,
-    state,
+  if (!/^courses\.zju\.edu\.cn$/i.test(location.hostname)) return;
+  if (!ensureTopFrame()) return;
+  if (window.__xzzdMounted) return;
+  window.__xzzdMounted = true;
+
+  patchBlobXhr();
+  document.addEventListener('click', onPlatformClick, true);
+
+  // 平台有些页面把附件区放在同源 iframe 里，那边也要挂一份
+  const hookFrames = () => {
+    try {
+      Array.from(window.frames || []).forEach((frame) => {
+        try {
+          frame.document.addEventListener('click', onPlatformClick, true);
+        } catch (e) { /* 跨域，忽略 */ }
+      });
+    } catch (e) { /* ignore */ }
   };
+  hookFrames();
+  window.addEventListener('load', hookFrames);
+  setTimeout(hookFrames, 1200);
+  setTimeout(hookFrames, 3000);
+
+  // 给命令行/脚本留的接口（无 UI）
+  window.__xzzd = {
+    downloadPage: () => runEntryDownload(null),
+    downloadCurrent: () => downloadCurrentCourseware(),
+    downloadWholeCourse,
+    pageCoursewares,
+    sniffedSignedUrls,
+    diagnostics: async () => ({
+      href: location.href,
+      hash: location.hash,
+      courseId: currentCourseId(),
+      activityId: currentActivityId(),
+      referType: currentReferType(),
+      shapes: state.shapes,
+      attempts: state.attempts,
+    }),
+  };
+  LOG('已接管「下载课件」按钮');
 }
